@@ -675,6 +675,105 @@ class VectorGraphRVQVAE(L.LightningModule):
             "q_embed": q_embed,
         }
 
+    def log_reconstruction(self, batch: Dict[str, Any], batch_idx: int):
+        if batch_idx != 0:
+            return
+        
+        # Check if logger exists and has experiment (TensorBoard)
+        if not self.logger or not hasattr(self.logger, "experiment"):
+            return
+
+        x_pad = batch["x_pad"].to(self.device)
+        mask = batch["mask"].to(self.device)
+        neighbors = batch["neighbors"].to(self.device)
+        ei_list = batch["edge_index"]
+
+        # Forward pass
+        out = self.forward(x_pad, mask=mask, neighbors=neighbors)
+        coords_pred = out["coords_pred"]   # [B,Q,2]
+        exist_logits = out["exist_logits"] # [B,Q]
+        q_embed = out["q_embed"]           # [B,Q,D]
+
+        # Visualize first sample in batch
+        idx = 0
+        
+        # 1. Ground Truth
+        gt_coords = x_pad[idx]
+        gt_mask = mask[idx]
+        gt_edges = ei_list[idx] # [2, E]
+        
+        gt_coords_np = gt_coords[gt_mask].detach().float().cpu().numpy()
+        gt_edges_np = gt_edges.detach().cpu().numpy()
+
+        # 2. Prediction
+        pred_coords = coords_pred[idx]
+        pred_exist = torch.sigmoid(exist_logits[idx])
+        
+        # Filter by existence threshold
+        exist_thr = 0.5
+        keep_mask = pred_exist > exist_thr # [Q]
+        
+        # Compute edge probabilities for this sample
+        # We treat 'keep_mask' as the active nodes
+        active_mask = keep_mask.unsqueeze(0) # [1, Q]
+        q_embed_1 = q_embed[idx].unsqueeze(0)
+        coords_pred_1 = pred_coords.unsqueeze(0)
+        
+        # Edge head expects batch
+        edge_logits = self.edge_head(q_embed_1, coords_pred_1, active_mask=active_mask) # [1, Q, Q]
+        edge_probs = torch.sigmoid(edge_logits[0]) # [Q, Q]
+        
+        # Plot
+        fig, axes = plt.subplots(1, 2, figsize=(12, 6))
+        
+        # GT Plot
+        ax = axes[0]
+        if len(gt_coords_np) > 0:
+            ax.scatter(gt_coords_np[:, 0], gt_coords_np[:, 1], c='blue', s=10, label='Node')
+            for k in range(gt_edges_np.shape[1]):
+                u, v = gt_edges_np[:, k]
+                # Sanity check indices
+                if u < len(gt_coords_np) and v < len(gt_coords_np):
+                    ax.plot([gt_coords_np[u, 0], gt_coords_np[v, 0]], 
+                            [gt_coords_np[u, 1], gt_coords_np[v, 1]], 'b-', alpha=0.3, linewidth=0.5)
+        ax.set_title("Ground Truth")
+        ax.invert_yaxis() # SVG coords usually y-down
+        ax.axis('equal')
+
+        # Pred Plot
+        ax = axes[1]
+        pred_coords_np = pred_coords.detach().float().cpu().numpy()
+        keep_idx = torch.where(keep_mask)[0].cpu().numpy()
+        
+        if len(keep_idx) > 0:
+            kept_coords = pred_coords_np[keep_idx]
+            ax.scatter(kept_coords[:, 0], kept_coords[:, 1], c='red', s=10, label='Pred')
+            
+            # Edges between kept nodes
+            edge_thr = 0.5
+            
+            # Get upper triangular indices
+            r, c = torch.triu_indices(len(pred_exist), len(pred_exist), offset=1, device=self.device)
+            
+            # Filter by probability
+            p_vals = edge_probs[r, c]
+            valid_edges = p_vals > edge_thr
+            
+            r_valid = r[valid_edges].cpu().numpy()
+            c_valid = c[valid_edges].cpu().numpy()
+            
+            for u, v in zip(r_valid, c_valid):
+                ax.plot([pred_coords_np[u, 0], pred_coords_np[v, 0]], 
+                        [pred_coords_np[u, 1], pred_coords_np[v, 1]], 'r-', alpha=0.3, linewidth=0.5)
+
+        ax.set_title(f"Reconstruction (Thr={exist_thr})")
+        ax.invert_yaxis()
+        ax.axis('equal')
+        
+        # Log to tensorboard
+        self.logger.experiment.add_figure("reconstruction", fig, global_step=self.global_step)
+        plt.close(fig)
+
     def _step(self, batch: Dict[str, Any], stage: str) -> torch.Tensor:
         x_pad = batch["x_pad"].to(self.device)         # [B,T,2]
         mask = batch["mask"].to(self.device)           # [B,T]
@@ -768,6 +867,8 @@ class VectorGraphRVQVAE(L.LightningModule):
 
     def validation_step(self, batch: Dict[str, Any], batch_idx: int):
         self._step(batch, "val")
+        if batch_idx == 0:
+            self.log_reconstruction(batch, batch_idx)
 
 
 # =============================================================================
@@ -871,6 +972,8 @@ def main():
         callbacks=callbacks,
         gradient_clip_val=args.gradient_clip_val,
         log_every_n_steps=20,
+        limit_train_batches=0.01,
+        limit_val_batches=0.01
     )
     trainer.fit(model, dm)
 
